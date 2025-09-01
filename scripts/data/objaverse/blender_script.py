@@ -2,13 +2,14 @@ import argparse
 import math
 import os
 import random
+import re
 import shutil
 import sys
 import time
 import urllib.request
 from mathutils import Vector
 import numpy as np
-import bpy
+import bpy 
 parser = argparse.ArgumentParser()
 parser.add_argument(
     "--object_path",
@@ -16,7 +17,7 @@ parser.add_argument(
     required=True,
     help="Path to the object file",
 )
-parser.add_argument("--output_dir", type=str, default="./rendering_random_32views")
+parser.add_argument("--output_dir", type=str, default="./rendering_random_32views3")
 parser.add_argument(
     "--engine", type=str, default="CYCLES", choices=["CYCLES", "BLENDER_EEVEE"]
 )
@@ -28,6 +29,12 @@ parser.add_argument("--camera_sampling", type=str, default="random",
                     help="相机采样策略: random=随机分布, uniform=均匀分布")
 parser.add_argument("--enhanced_normals", action="store_true", default=True,
                     help="启用增强的法线图渲染配置以获得更高质量的法线图")
+parser.add_argument("--depth_scale", type=float, default=10.0,
+                    help="深度缩放因子，深度值将被缩放到[0, depth_scale]范围")
+parser.add_argument("--depth_format", type=str, default="PNG", choices=["PNG", "OPEN_EXR"],
+                    help="深度图输出格式: PNG=8-bit缩放深度, OPEN_EXR=绝对深度值")
+parser.add_argument("--invert_depth", action="store_true", default=False,
+                    help="是否反转深度符号，适用于某些坐标系统（通常不需要）")
 
 if "--" in sys.argv:
     argv = sys.argv[sys.argv.index("--") + 1:]
@@ -70,8 +77,9 @@ scene.view_layers[0].cycles.use_denoising = False  # 法线图不需要降噪，
 cycles_preferences = bpy.context.preferences.addons["cycles"].preferences
 cycles_preferences.compute_device_type = "CUDA"
 cuda_devices = cycles_preferences.get_devices_for_type("CUDA")
-for device in cuda_devices:
-    device.use = False
+# 启用指定GPU，其余禁用
+for idx, device in enumerate(cuda_devices):
+    device.use = (idx == args.gpu_id)
 
 def compose_RT(R, T):
     return np.hstack((R, T.reshape(-1, 1)))
@@ -269,21 +277,77 @@ def setup_camera():
     cam = scene.objects["Camera"]
     # 增加相机距离，让物体完全显示在视野内
     cam.location = (0, 2.0, 0)  # 从1.2增加到2.0
-    # 设置50度FOV (InstantMesh要求)
-    cam.data.angle = math.radians(50)
-    # 设置传感器尺寸为正方形
-    cam.data.sensor_width = 32
-    cam.data.sensor_height = 32
-    cam.data.sensor_fit = 'HORIZONTAL'  # 确保FOV计算基准
-    # 裁剪平面
+    
+    # 正确设置50度FOV (InstantMesh要求)
+    cam.data.type = 'PERSP'
+    cam.data.lens_unit = 'FOV'
+    cam.data.angle = math.radians(50)  # 50度垂直FOV
+    
+    # 设置传感器为正方形，确保FOV计算正确
+    cam.data.sensor_width = 32.0
+    cam.data.sensor_height = 32.0
+    cam.data.sensor_fit = 'VERTICAL'  # 使用垂直FOV作为基准
+    
+    # 裁剪平面 - 与depth_scale保持一致
     cam.data.clip_start = 0.01
-    cam.data.clip_end = 10.0  # 从6.0增加到10.0
+    cam.data.clip_end = args.depth_scale * 1.2  # 稍微超出depth_scale以避免裁剪
+    
     cam_constraint = cam.constraints.new(type="TRACK_TO")
     cam_constraint.track_axis = "TRACK_NEGATIVE_Z"
     cam_constraint.up_axis = "UP_Y"
     return cam, cam_constraint
 
+def debug_depth_range(camera):
+    """
+    调试函数：计算场景的实际深度范围，帮助诊断深度问题
+    """
+    # 获取场景边界框
+    bbox_min, bbox_max = scene_bbox()
+    
+    # 计算相机到物体的距离范围
+    cam_location = camera.location
+    
+    # 计算到边界框各个角的距离
+    corners = [
+        Vector([bbox_min.x, bbox_min.y, bbox_min.z]),
+        Vector([bbox_min.x, bbox_min.y, bbox_max.z]),
+        Vector([bbox_min.x, bbox_max.y, bbox_min.z]),
+        Vector([bbox_min.x, bbox_max.y, bbox_max.z]),
+        Vector([bbox_max.x, bbox_min.y, bbox_min.z]),
+        Vector([bbox_max.x, bbox_min.y, bbox_max.z]),
+        Vector([bbox_max.x, bbox_max.y, bbox_min.z]),
+        Vector([bbox_max.x, bbox_max.y, bbox_max.z]),
+    ]
+    
+    distances = [(corner - cam_location).length for corner in corners]
+    min_depth = min(distances)
+    max_depth = max(distances)
+    
+    print(f"调试信息:")
+    print(f"  相机位置: {cam_location}")
+    print(f"  物体边界框: {bbox_min} 到 {bbox_max}")
+    print(f"  实际深度范围: {min_depth:.3f} 到 {max_depth:.3f}")
+    print(f"  设置的depth_scale: {args.depth_scale}")
+    print(f"  相机裁剪范围: {camera.data.clip_start} 到 {camera.data.clip_end}")
+    
+    if max_depth > args.depth_scale:
+        print(f"⚠️  警告: 最大深度 {max_depth:.3f} 超过 depth_scale {args.depth_scale}")
+        print(f"   建议设置 --depth_scale {max_depth * 1.2:.1f}")
+    
+    return min_depth, max_depth
+
 def save_images(object_file: str) -> None:
+    """
+    渲染物体的多视角图像，包括RGB、深度图和法线图
+    
+    深度图处理说明：
+    - PNG格式：深度值通过除以depth_scale归一化到[0, 1]，然后映射到[0, 255]
+      在训练时需要通过 depth_real = (depth_png / 255.0) * depth_scale 恢复绝对深度
+    - OPEN_EXR格式：直接存储绝对深度值，无需缩放，但文件较大
+    
+    深度范围：[0, depth_scale]，超出此范围的深度值将被裁剪到[0, 1]
+    符号反转：默认关闭，Blender深度值本身是正数
+    """
     os.makedirs(args.output_dir, exist_ok=True)
     reset_scene()
     load_object(object_file)
@@ -322,16 +386,53 @@ def save_images(object_file: str) -> None:
     # Save images
     image_save = tree.nodes.new(type='CompositorNodeOutputFile')
     links.new(rl.outputs['Image'], image_save.inputs[0])
+    # 显式设置RGB图像输出格式
+    image_save.base_path = ""
+    image_save.file_slots[0].use_node_format = True
+    image_save.format.file_format = 'PNG'
+    image_save.format.color_mode = 'RGBA'
+    image_save.format.color_depth = '8'
 
-    # Save depth maps as png
-    depth_map = tree.nodes.new(type="CompositorNodeMapRange")
-    depth_map.inputs['From Min'].default_value = 0.01
-    depth_map.inputs['From Max'].default_value = 10.0  # 匹配新的clip_end
-    depth_map.inputs['To Min'].default_value = 0.0
-    depth_map.inputs['To Max'].default_value = 1.0
-    links.new(rl.outputs['Depth'], depth_map.inputs['Value'])
-    depth_save = tree.nodes.new(type="CompositorNodeOutputFile")
-    links.new(depth_map.outputs[0], depth_save.inputs[0])
+    # Save depth maps - 根据格式选择处理方式
+    if args.depth_format == "OPEN_EXR":
+        # OPEN_EXR格式：直接存储绝对深度值，无需缩放
+        depth_save = tree.nodes.new(type="CompositorNodeOutputFile")
+        links.new(rl.outputs['Depth'], depth_save.inputs[0])
+        depth_save.base_path = ""
+        depth_save.file_slots[0].use_node_format = True
+        depth_save.format.file_format = 'OPEN_EXR'
+        depth_save.format.color_mode = 'BW'  # 单通道
+        depth_save.format.color_depth = '32'  # 32-bit浮点
+    else:
+        # PNG格式：需要缩放深度以适应[0, 255]范围
+        depth_input = rl.outputs['Depth']
+        
+        # 步骤1: 可选的深度符号反转（通常不需要，Blender深度值是正数）
+        if args.invert_depth:
+            depth_invert = tree.nodes.new(type="CompositorNodeMath")
+            depth_invert.operation = 'MULTIPLY'
+            depth_invert.inputs[1].default_value = -1.0  # 反转深度符号
+            links.new(depth_input, depth_invert.inputs[0])
+            depth_input = depth_invert.outputs[0]
+        
+        # 步骤2: 深度归一化 - 将深度值除以depth_scale，映射到[0, 1]
+        # 这样depth_scale范围内的深度值将映射到[0, 1]，对应PNG的[0, 255]
+        depth_normalize = tree.nodes.new(type="CompositorNodeMath")
+        depth_normalize.operation = 'DIVIDE'
+        depth_normalize.inputs[1].default_value = args.depth_scale
+        # 使用clamp确保值在[0,1]范围内
+        depth_normalize.use_clamp = True
+        links.new(depth_input, depth_normalize.inputs[0])
+        
+        depth_save = tree.nodes.new(type="CompositorNodeOutputFile")
+        links.new(depth_normalize.outputs[0], depth_save.inputs[0])
+        # PNG 8-bit格式，值范围[0, 255]代表深度范围[0, depth_scale]
+        depth_save.base_path = ""
+        depth_save.file_slots[0].use_node_format = True
+        depth_save.format.file_format = 'PNG'
+        depth_save.format.color_mode = 'BW'  # 单通道黑白
+        depth_save.format.color_depth = '8'   # 8-bit，值范围[0, 255]
+        depth_save.format.compression = 15
 
     # FlexiCubes风格的法线图处理
     # 分离法线的XYZ分量
@@ -394,41 +495,60 @@ def save_images(object_file: str) -> None:
     links.new(constant_color.outputs[0], mix_normal.inputs[1])  # Background
     links.new(blur_node.outputs['Image'], mix_normal.inputs[2])  # Foreground
     
-    normal_save = tree.nodes.new(type="CompositorNodeOutputFile")
-    links.new(mix_normal.outputs[0], normal_save.inputs[0])
-
-# #添加角度列表
-#     num_views=args.num_images
-#     views = [(0,30)]
-#     azimuths = np.linspace(0, 360, num_views, endpoint=False)  # 均匀分布方位角
-#     elevations = [30] * num_views  # 仰角固定为 30 度
-#     for i in range(1, num_views):
-#         views.append((azimuths[i], elevations[i]))  # 将计算出的视角添加到视角列表
+    # 确保法线图输出为RGB三通道：直接使用RGB模式分离，忽略Alpha
+    normal_separate = tree.nodes.new(type="CompositorNodeSeparateColor")
+    normal_separate.mode = 'RGB'  # 使用RGB模式分离
+    links.new(mix_normal.outputs[0], normal_separate.inputs[0])
     
+    # 重新组合为RGB（不包含Alpha通道）
+    normal_combine = tree.nodes.new(type="CompositorNodeCombineColor")
+    normal_combine.mode = 'RGB'  # 设置为RGB模式
+    links.new(normal_separate.outputs[0], normal_combine.inputs[0])  # R
+    links.new(normal_separate.outputs[1], normal_combine.inputs[1])  # G
+    links.new(normal_separate.outputs[2], normal_combine.inputs[2])  # B
+    
+    normal_save = tree.nodes.new(type="CompositorNodeOutputFile")
+    links.new(normal_combine.outputs[0], normal_save.inputs[0])
+    # 显式设置法线为三通道RGB，避免产生Alpha
+    normal_save.base_path = ""
+    normal_save.file_slots[0].use_node_format = True
+    normal_save.format.file_format = 'PNG'
+    normal_save.format.color_mode = 'RGB'
+    normal_save.format.color_depth = '16'
 
 
+    # 在第一次渲染前调试深度范围
+    print(f"开始渲染 {args.num_images} 个视图...")
+    
     for i in range(args.num_images):
         # RGB图像设置
-        image_save.base_path = ""  # 使用完整路径，不设置base_path
-        image_save.file_slots[0].use_node_format = False  # 禁用自动编号
-        image_save.file_slots[0].path = os.path.join(img_dir, f"{i:03d}")
+        image_save.base_path = img_dir  # 绝对输出目录
+        image_save.file_slots[0].use_node_format = True  # 使用节点格式，避免被场景覆盖
+        image_save.file_slots[0].path = f"{i:03d}"
         image_save.format.file_format = 'PNG'
         image_save.format.color_mode = 'RGBA'
 
-        # 深度图设置
-        depth_save.base_path = ""
-        depth_save.file_slots[0].use_node_format = False
-        depth_save.file_slots[0].path = os.path.join(img_dir, f"{i:03d}_depth")
-        depth_save.format.file_format = 'PNG'
-        depth_save.format.color_mode = 'BW'
-        depth_save.format.color_depth = '8'
+        # 深度图设置 - 根据格式设置
+        depth_save.base_path = img_dir
+        depth_save.file_slots[0].use_node_format = True
+        depth_save.file_slots[0].path = f"{i:03d}_depth"
+        
+        if args.depth_format == "OPEN_EXR":
+            depth_save.format.file_format = 'OPEN_EXR'
+            depth_save.format.color_mode = 'BW'
+            depth_save.format.color_depth = '32'  # 32-bit浮点
+        else:
+            depth_save.format.file_format = 'PNG'
+            depth_save.format.color_mode = 'BW'   # 单通道黑白
+            depth_save.format.color_depth = '8'   # 8-bit，值范围[0, 255]
+            depth_save.format.compression = 15
 
-        # 法线图设置 - 根据enhanced_normals参数优化
-        normal_save.base_path = ""
-        normal_save.file_slots[0].use_node_format = False
-        normal_save.file_slots[0].path = os.path.join(img_dir, f"{i:03d}_normal")
+        # 法线图设置 - 强制RGB三通道输出
+        normal_save.base_path = img_dir
+        normal_save.file_slots[0].use_node_format = True
+        normal_save.file_slots[0].path = f"{i:03d}_normal"
         normal_save.format.file_format = 'PNG'
-        normal_save.format.color_mode = 'RGBA'
+        normal_save.format.color_mode = 'RGB'  # 强制RGB三通道
         
         if args.enhanced_normals:
             # 增强法线图质量设置
@@ -438,42 +558,34 @@ def save_images(object_file: str) -> None:
             # 标准设置
             normal_save.format.color_depth = '8'
             normal_save.format.compression = 50
-        # # Set the camera position
-        # azimuth, elevation=views[i]
-        # camera = set_camera_location(camera, 4.0, azimuth, elevation, option='random')
-        # bpy.ops.render.render(write_still=True)
-
-
         # Set the camera position based on sampling strategy
         if args.camera_sampling == "uniform":
             # 均匀分布：第一个视图是正面，其余按均匀角度分布
             if i == 0:
-                camera_option = 'front'
+                camera = set_camera_location(camera, option='front')
             else:
                 # 创建均匀分布的相机位置
                 azimuth = (i - 1) * 360.0 / (args.num_images - 1)  # 0到360度均匀分布
                 elevation = 30.0  # 固定仰角30度
                 camera = set_camera_location_with_angles(camera, azimuth, elevation)
-                bpy.ops.render.render(write_still=True)
-                RT_w2c = get_3x4_RT_matrix_from_blender(camera)
-                cam_params["cam_poses"].append(RT_w2c)
-                continue
         else:
             # 随机分布：第一个视图是正面，其余随机
             camera_option = 'random' if i > 0 else 'front'
-            
-        if args.camera_sampling != "uniform" or i == 0:
             camera = set_camera_location(camera, option=camera_option)
-            bpy.ops.render.render(write_still=True)
-
+            
+        # 在第一次渲染时输出深度调试信息
+        if i == 0:
+            debug_depth_range(camera)
+            
+        # Render the image
+        bpy.ops.render.render(write_still=True)
+        
         # Save camera RT matrix (W2C) - 符合InstantMesh数据加载器格式
         RT_w2c = get_3x4_RT_matrix_from_blender(camera)
         cam_params["cam_poses"].append(RT_w2c)
 
-        # cam_params["eular"].append(camera.rotation_euler)
-        # cam_params["location"].append(camera.location)
+
     # 清理Blender自动添加的文件名后缀
-    import re
     for file_name in os.listdir(img_dir):
         file_path = os.path.join(img_dir, file_name)
         if os.path.isfile(file_path):
@@ -553,13 +665,27 @@ def validate_output_data(img_dir: str, num_images: int) -> dict:
         
         # 验证图像文件
         missing_files = []
-        file_types = ['', '_depth', '_normal']  # RGB、深度、法线图
         
         for i in range(num_images):
-            for file_type in file_types:
-                png_file = os.path.join(img_dir, f"{i:03d}{file_type}.png")
-                if not os.path.exists(png_file):
-                    missing_files.append(f"{i:03d}{file_type}.png")
+            # 检查RGB图像（始终是PNG）
+            rgb_file = os.path.join(img_dir, f"{i:03d}.png")
+            if not os.path.exists(rgb_file):
+                missing_files.append(f"{i:03d}.png")
+            
+            # 检查深度图（根据格式）
+            if args.depth_format == "OPEN_EXR":
+                depth_file = os.path.join(img_dir, f"{i:03d}_depth.exr")
+                if not os.path.exists(depth_file):
+                    missing_files.append(f"{i:03d}_depth.exr")
+            else:
+                depth_file = os.path.join(img_dir, f"{i:03d}_depth.png")
+                if not os.path.exists(depth_file):
+                    missing_files.append(f"{i:03d}_depth.png")
+            
+            # 检查法线图（始终是PNG）
+            normal_file = os.path.join(img_dir, f"{i:03d}_normal.png")
+            if not os.path.exists(normal_file):
+                missing_files.append(f"{i:03d}_normal.png")
         
         if missing_files:
             return {"success": False, "message": f"缺少图像文件: {missing_files[:5]}{'...' if len(missing_files) > 5 else ''}"}
@@ -567,7 +693,14 @@ def validate_output_data(img_dir: str, num_images: int) -> dict:
         # 验证第一个图像的尺寸和格式
         first_image = os.path.join(img_dir, "000.png")
         try:
-            from PIL import Image
+            try:
+                from PIL import Image
+            except ImportError:
+                # 如果PIL不可用，尝试使用opencv或跳过验证
+                import warnings
+                warnings.warn("PIL不可用，跳过图像格式验证")
+                return {"success": True, "message": f"所有{num_images}个视图的数据完整（跳过格式验证）"}
+            
             with Image.open(first_image) as img:
                 if img.size != (args.resolution, args.resolution):
                     return {"success": False, "message": f"图像尺寸错误: 期望{args.resolution}x{args.resolution}, 实际{img.size}"}
@@ -618,8 +751,8 @@ def get_calibration_matrix_K_from_blender(camera, return_principles=False):
     width = render.resolution_x * render.pixel_aspect_x
     height = render.resolution_y * render.pixel_aspect_y
     
-    # 使用FOV角度计算归一化焦距（符合项目标准）
-    fov_degrees = math.degrees(camera.angle)
+    # 直接使用50度FOV计算归一化焦距（确保精确匹配InstantMesh要求）
+    fov_degrees = 50.0  # 强制使用50度，确保与InstantMesh精确匹配
     focal_length_normalized = 0.5 / np.tan(np.deg2rad(fov_degrees) * 0.5)
     
     # 归一化内参矩阵（符合InstantMesh项目标准）
