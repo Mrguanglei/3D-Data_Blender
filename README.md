@@ -1,4 +1,4 @@
-# Personal code changes: The OpenLRM script was utilized to train the InstantMesh
+#  train the E-Mesh
 
 [![Code License](https://img.shields.io/badge/Code%20License-Apache_2.0-yellow.svg)](LICENSE)
 [![Weight License](https://img.shields.io/badge/Weight%20License-CC%20By%20NC%204.0-red)](LICENSE_WEIGHT)
@@ -9,12 +9,9 @@
 
 
 
-
 ## News
 
 - [2024.07.15] Update [training  InstantMesh  code](scripts/data/objaverse/blender_script.py) and release [OpenLRM v1.1.1](https://github.com/3DTopia/OpenLRM/releases/tag/v1.1.1).
-
-
 
 
 
@@ -38,38 +35,50 @@ cd OpenLRM
 
 ### Dataset format 
 
-│——rendering_random_32views
-
-│       │---object1/
-
-│       │      │---000.png
-
-│       │      │--- 000_normal.png
-
-│       │      │--- 000_depth.png
-
-│       │      │---001.png
-
-│       │      │--- 001_normal.png
-
-│       │      │--- 001_depth.png
-
-│       │      │--- ......
-
-│       │      │--- camera.npz
-
-│       │---object2/
-
-│      .......
-
-│——valid_paths.json
-
-
+```Bash
+|--rendering_random_32views
+|--- 1 # object id
+| |--- 000.png
+| |--- 000_normal.png
+| |--- 000_depth.png
+| |--- ...
+| |--- 031.png
+| |--- 031_normal.png
+| |--- 031_depth.png
+| |--- camera.npz # 
+|--- 2 # object id
+| |--- 000.png
+| |--- 000_normal.png
+| |--- 000_depth.png
+| |--- ...
+| |--- 031.png
+| |--- 031_normal.png
+| |--- 031_depth.png
+| |--- camera.npz #
+|--- 3 # object id
+| |--- 000.png
+| |--- 000_normal.png
+| |--- 000_depth.png
+| |--- ...
+| |--- 031.png
+| |--- 031_normal.png
+| |--- 031_depth.png
+| |--- camera.npz # 
+|-- valid_paths.json
+|-- ...
+```
 
 valid_paths.json fomerat:
+```Bash
+{
+  "good_objs":[
+      "1",
+      "2",
+      ...
+  ]
 
-{  "good_objs": [     "object1"    ,   "object2"   ,   "object3",    ......  ] }
-
+}
+```
 
 
 ### Downloading the dataset 
@@ -89,7 +98,6 @@ valid_paths.json fomerat:
   DIRECTORY="/your/path/OpenLRM/data"    #Put the path to the dataset file you downloaded here
   ```
 
-  
 
 ### Blender:
 
@@ -117,14 +125,7 @@ If you find this work useful for your research, please consider citing:
 }
 ```
 
-```
-@misc{openlrm,
-  title = {OpenLRM: Open-Source Large Reconstruction Models},
-  author = {Zexin He and Tengfei Wang},
-  year = {2023},
-  howpublished = {\url{https://github.com/3DTopia/OpenLRM}},
-}
-```
+
 
 ## License
 
