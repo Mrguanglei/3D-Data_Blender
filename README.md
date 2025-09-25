@@ -11,7 +11,7 @@
 
 ## News
 
-- [2024.07.15] Update [training  InstantMesh  code](scripts/data/objaverse/blender_script.py) and release [OpenLRM v1.1.1](https://github.com/3DTopia/OpenLRM/releases/tag/v1.1.1).
+- [2025.09.15] Update [training  E-Mesh  code](scripts/data/objaverse/blender_script.py) and release [OpenLRM v1.1.1](https://github.com/3DTopia/OpenLRM/releases/tag/v1.1.1).
 
 
 
