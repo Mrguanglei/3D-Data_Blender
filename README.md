@@ -126,8 +126,11 @@ If you find this work useful for your research, please consider citing:
 ```
 
 
-
 ## License
 
 - OpenLRM as a whole is licensed under the [Apache License, Version 2.0](LICENSE), while certain components are covered by [NVIDIA's proprietary license](LICENSE_NVIDIA). Users are responsible for complying with the respective licensing terms of each component.
 - Model weights are licensed under the [Creative Commons Attribution-NonCommercial 4.0 International License](LICENSE_WEIGHT). They are provided for research purposes only, and CANNOT be used commercially.
+
+  ## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=Mrguanglei/3D-Data_Blender&type=Date)](https://star-history.com/#Mrguanglei/3D-Data_Blender&Date)
